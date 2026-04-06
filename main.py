@@ -61,21 +61,26 @@ def scroll(driver: webdriver.Chrome, scroll_count: int = 5, pause_seconds: float
 
 
 def extract_articles(driver: webdriver.Chrome):
-    selectors = [
-        ".article",
-        "article",
-        "a.article",
-        "div.article",
-    ]
-    seen = []
+    articles = []
+    seen_hrefs = set()
     seen_ids = set()
-    for selector in selectors:
-        for element in driver.find_elements(By.CSS_SELECTOR, selector):
-            element_id = getattr(element, "id", None) or element.id
-            if element_id not in seen_ids:
-                seen.append(element)
-                seen_ids.add(element_id)
-    return seen
+
+    for element in driver.find_elements(By.CSS_SELECTOR, "a.article"):
+        href = (element.get_attribute("href") or "").strip()
+        if href:
+            if href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            articles.append(element)
+            continue
+
+        element_id = getattr(element, "id", None) or element.id
+        if element_id in seen_ids:
+            continue
+        seen_ids.add(element_id)
+        articles.append(element)
+
+    return articles
 
 
 def extract_article_signature(article) -> str:
@@ -112,6 +117,7 @@ def count_dates_from_search_pages(
     dates: list[str],
     scroll_count: int,
     pause_seconds: float,
+    start_page: int,
     max_pages: int,
     stop_prefixes: list[str] | None = None,
     debug: bool = False,
@@ -120,7 +126,7 @@ def count_dates_from_search_pages(
     seen_page_signatures: set[tuple[str, ...]] = set()
     result = {date_text: 0 for date_text in dates}
 
-    for page_number in range(1, max_pages + 1):
+    for page_number in range(start_page, max_pages + 1):
         page_url = build_page_url(base_url, page_number)
         if driver.current_url.rstrip("/") != page_url.rstrip("/"):
             driver.get(page_url)
@@ -152,11 +158,11 @@ def count_dates_from_search_pages(
         if stop_prefixes:
             page_dates = [extract_date_text(article) for article in articles]
             valid_page_dates = [date_text for date_text in page_dates if date_text]
-            if valid_page_dates and any(
+            if valid_page_dates and all(
                 not any(date_text.startswith(prefix) for prefix in stop_prefixes)
                 for date_text in valid_page_dates
             ):
-                debug_log(debug, f"stopping at page {page_number} because date prefix changed")
+                debug_log(debug, f"stopping at page {page_number} because all visible dates are outside target prefixes")
                 break
 
     return result
@@ -218,6 +224,12 @@ def parse_args() -> argparse.Namespace:
         help="확인할 최대 페이지 수. /p/2, /p/3 형태 페이지까지 순회합니다.",
     )
     parser.add_argument(
+        "--start-page",
+        type=int,
+        default=1,
+        help="검색 결과에서 시작할 페이지 번호입니다. 예: 22",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="현재 URL, 페이지별 글 수, 샘플 날짜를 출력합니다.",
@@ -242,6 +254,7 @@ def main() -> int:
             args.dates,
             args.scrolls,
             args.scroll_pause,
+            args.start_page,
             args.max_pages,
             stop_prefixes,
             args.debug,
