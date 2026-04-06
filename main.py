@@ -10,7 +10,8 @@ from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, WebDriverException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 
 LOGIN_URL = "https://everytime.kr/login"
@@ -35,85 +36,29 @@ def login(driver: webdriver.Chrome) -> None:
     input("에브리타임 로그인 완료 후 Enter를 누르세요: ")
 
 
-def extract_board_id(board_url: str) -> str | None:
-    path = urlparse(board_url).path.rstrip("/")
-    match = re.search(r"/(\d+)$", path)
-    if match:
-        return match.group(1)
-    return None
+def normalize_board_url(board_url: str) -> str:
+    parsed = urlparse(board_url)
+    cleaned_path = re.sub(r"/(all|p/\d+)$", "", parsed.path.rstrip("/"))
+    return f"{parsed.scheme}://{parsed.netloc}{cleaned_path}"
 
 
-def find_search_input(driver: webdriver.Chrome):
-    selectors = [
-        "input[type='search']",
-        "input[name='keyword']",
-        "form.search input",
-        "div.search input",
-        "input.text",
-    ]
-    for selector in selectors:
-        elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        for element in elements:
-            if element.is_displayed() and element.is_enabled():
-                return element
-    return None
+def debug_log(enabled: bool, message: str) -> None:
+    if enabled:
+        print(f"[debug] {message}")
 
 
-def try_open_search_ui(driver: webdriver.Chrome) -> None:
-    selectors = [
-        "a.search",
-        "button.search",
-        "[class*='search']",
-        "[href*='search']",
-    ]
-    for selector in selectors:
-        elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        for element in elements:
-            if element.is_displayed() and element.is_enabled():
-                try:
-                    element.click()
-                    time.sleep(1)
-                    return
-                except WebDriverException:
-                    continue
-
-
-def search(driver: webdriver.Chrome, keyword: str, board_url: str, wait_seconds: float = 3.0) -> None:
-    driver.get(board_url)
+def search(
+    driver: webdriver.Chrome,
+    keyword: str,
+    board_url: str,
+    wait_seconds: float = 3.0,
+    debug: bool = False,
+) -> None:
+    normalized_board_url = normalize_board_url(board_url)
+    search_url = f"{normalized_board_url}/all/{quote(keyword)}"
+    driver.get(search_url)
     time.sleep(wait_seconds)
-
-    search_input = find_search_input(driver)
-    if search_input is None:
-        try_open_search_ui(driver)
-        search_input = find_search_input(driver)
-
-    if search_input is not None:
-        search_input.clear()
-        search_input.send_keys(keyword)
-        search_input.send_keys(Keys.ENTER)
-        time.sleep(wait_seconds)
-        return
-
-    board_id = extract_board_id(board_url)
-    direct_urls = []
-    if board_id:
-        encoded_keyword = quote(keyword)
-        direct_urls.extend(
-            [
-                f"https://everytime.kr/search/{board_id}/{encoded_keyword}",
-                f"https://everytime.kr/search/board/{board_id}/{encoded_keyword}",
-            ]
-        )
-
-    for direct_url in direct_urls:
-        driver.get(direct_url)
-        time.sleep(wait_seconds)
-        if extract_articles(driver):
-            return
-
-    raise RuntimeError(
-        "자유게시판 검색창을 찾지 못했습니다. 에브리타임 화면 구조가 바뀌었을 수 있습니다."
-    )
+    debug_log(debug, f"opened search url: {driver.current_url}")
 
 
 def scroll(driver: webdriver.Chrome, scroll_count: int = 5, pause_seconds: float = 2.0) -> None:
@@ -123,22 +68,109 @@ def scroll(driver: webdriver.Chrome, scroll_count: int = 5, pause_seconds: float
 
 
 def extract_articles(driver: webdriver.Chrome):
-    return driver.find_elements(By.CLASS_NAME, "article")
+    selectors = [
+        ".article",
+        "article",
+        "a.article",
+        "div.article",
+    ]
+    seen = []
+    seen_ids = set()
+    for selector in selectors:
+        for element in driver.find_elements(By.CSS_SELECTOR, selector):
+            element_id = getattr(element, "id", None) or element.id
+            if element_id not in seen_ids:
+                seen.append(element)
+                seen_ids.add(element_id)
+    return seen
+
+
+def extract_article_signature(article) -> str:
+    return " ".join(article.text.split())
 
 
 def extract_date_text(article) -> str:
-    try:
-        return article.find_element(By.CLASS_NAME, "time").text.strip()
-    except NoSuchElementException:
-        return ""
+    selectors = [
+        ".time",
+        "time",
+        "small.time",
+        "p.info span.time",
+        ".status .time",
+    ]
+    for selector in selectors:
+        try:
+            text = article.find_element(By.CSS_SELECTOR, selector).text.strip()
+            if text:
+                return text
+        except NoSuchElementException:
+            continue
+    return ""
 
 
-def count_by_date(driver: webdriver.Chrome, dates: list[str]) -> dict[str, int]:
-    articles = extract_articles(driver)
+def build_page_url(base_url: str, page_number: int) -> str:
+    cleaned_url = re.sub(r"/p/\d+$", "", base_url.rstrip("/"))
+    if page_number <= 1:
+        return cleaned_url
+    return f"{cleaned_url}/p/{page_number}"
+
+
+def collect_date_texts(
+    driver: webdriver.Chrome,
+    scroll_count: int,
+    pause_seconds: float,
+    max_pages: int,
+    stop_prefixes: list[str] | None = None,
+    debug: bool = False,
+) -> list[str]:
+    base_url = re.sub(r"/p/\d+$", "", driver.current_url.rstrip("/"))
+    seen_page_signatures: set[tuple[str, ...]] = set()
+    collected_dates: list[str] = []
+
+    for page_number in range(1, max_pages + 1):
+        page_url = build_page_url(base_url, page_number)
+        if driver.current_url.rstrip("/") != page_url.rstrip("/"):
+            driver.get(page_url)
+            time.sleep(pause_seconds)
+        debug_log(debug, f"page {page_number} url: {driver.current_url}")
+
+        scroll(driver, scroll_count, pause_seconds)
+        articles = extract_articles(driver)
+        debug_log(debug, f"page {page_number} article count: {len(articles)}")
+        if not articles:
+            break
+
+        page_signatures = tuple(
+            extract_article_signature(article) for article in articles[:10]
+        )
+        if page_signatures in seen_page_signatures:
+            break
+        seen_page_signatures.add(page_signatures)
+
+        for article in articles:
+            article_date = extract_date_text(article)
+            if article_date:
+                collected_dates.append(article_date)
+
+        sample_dates = [extract_date_text(article) for article in articles[:5]]
+        debug_log(debug, f"page {page_number} sample dates: {sample_dates}")
+
+        if stop_prefixes:
+            page_dates = [extract_date_text(article) for article in articles]
+            valid_page_dates = [date_text for date_text in page_dates if date_text]
+            if valid_page_dates and any(
+                not any(date_text.startswith(prefix) for prefix in stop_prefixes)
+                for date_text in valid_page_dates
+            ):
+                debug_log(debug, f"stopping at page {page_number} because date prefix changed")
+                break
+
+    return collected_dates
+
+
+def count_by_date(date_texts: list[str], dates: list[str]) -> dict[str, int]:
     result = {date_text: 0 for date_text in dates}
 
-    for article in articles:
-        article_date = extract_date_text(article)
+    for article_date in date_texts:
         for target_date in dates:
             if target_date in article_date:
                 result[target_date] += 1
@@ -195,23 +227,45 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="스크롤 사이 대기 시간(초)",
     )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=20,
+        help="확인할 최대 페이지 수. /p/2, /p/3 형태 페이지까지 순회합니다.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="현재 URL, 페이지별 글 수, 샘플 날짜를 출력합니다.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    stop_prefixes = sorted({date_text[:3] for date_text in args.dates if len(date_text) >= 3})
 
     driver = None
     try:
         driver = build_driver(args.driver_path)
         login(driver)
-        search(driver, args.keyword, args.board_url, args.wait_seconds)
-        scroll(driver, args.scrolls, args.scroll_pause)
+        search(driver, args.keyword, args.board_url, args.wait_seconds, args.debug)
+        WebDriverWait(driver, max(3, int(args.wait_seconds) + 2)).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".article, article"))
+        )
+        date_texts = collect_date_texts(
+            driver,
+            args.scrolls,
+            args.scroll_pause,
+            args.max_pages,
+            stop_prefixes,
+            args.debug,
+        )
 
-        articles = extract_articles(driver)
-        print(f"전체 게시글 수: {len(articles)}")
+        debug_log(args.debug, f"collected dates sample: {date_texts[:10]}")
+        print(f"수집한 날짜 정보 수: {len(date_texts)}")
 
-        result = count_by_date(driver, args.dates)
+        result = count_by_date(date_texts, args.dates)
         print("날짜별 게시글 수:")
         for date_text, count in result.items():
             print(f"{date_text}: {count}")
