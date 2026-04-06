@@ -2,7 +2,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 import re
 
 import pandas as pd
@@ -15,7 +15,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 
 LOGIN_URL = "https://everytime.kr/login"
-DEFAULT_BOARD_URL = "https://everytime.kr/377388"
+GLOBAL_SEARCH_URL = "https://everytime.kr/search/all/{keyword}"
 
 
 def build_driver(driver_path: str | None = None) -> webdriver.Chrome:
@@ -36,12 +36,6 @@ def login(driver: webdriver.Chrome) -> None:
     input("에브리타임 로그인 완료 후 Enter를 누르세요: ")
 
 
-def normalize_board_url(board_url: str) -> str:
-    parsed = urlparse(board_url)
-    cleaned_path = re.sub(r"/(all|p/\d+)$", "", parsed.path.rstrip("/"))
-    return f"{parsed.scheme}://{parsed.netloc}{cleaned_path}"
-
-
 def debug_log(enabled: bool, message: str) -> None:
     if enabled:
         print(f"[debug] {message}")
@@ -50,12 +44,11 @@ def debug_log(enabled: bool, message: str) -> None:
 def search(
     driver: webdriver.Chrome,
     keyword: str,
-    board_url: str,
+    search_url_template: str,
     wait_seconds: float = 3.0,
     debug: bool = False,
 ) -> None:
-    normalized_board_url = normalize_board_url(board_url)
-    search_url = f"{normalized_board_url}/all/{quote(keyword)}"
+    search_url = search_url_template.format(keyword=quote(keyword))
     driver.get(search_url)
     time.sleep(wait_seconds)
     debug_log(debug, f"opened search url: {driver.current_url}")
@@ -114,17 +107,18 @@ def build_page_url(base_url: str, page_number: int) -> str:
     return f"{cleaned_url}/p/{page_number}"
 
 
-def collect_date_texts(
+def count_dates_from_search_pages(
     driver: webdriver.Chrome,
+    dates: list[str],
     scroll_count: int,
     pause_seconds: float,
     max_pages: int,
     stop_prefixes: list[str] | None = None,
     debug: bool = False,
-) -> list[str]:
+) -> dict[str, int]:
     base_url = re.sub(r"/p/\d+$", "", driver.current_url.rstrip("/"))
     seen_page_signatures: set[tuple[str, ...]] = set()
-    collected_dates: list[str] = []
+    result = {date_text: 0 for date_text in dates}
 
     for page_number in range(1, max_pages + 1):
         page_url = build_page_url(base_url, page_number)
@@ -148,8 +142,9 @@ def collect_date_texts(
 
         for article in articles:
             article_date = extract_date_text(article)
-            if article_date:
-                collected_dates.append(article_date)
+            for target_date in dates:
+                if article_date == target_date:
+                    result[target_date] += 1
 
         sample_dates = [extract_date_text(article) for article in articles[:5]]
         debug_log(debug, f"page {page_number} sample dates: {sample_dates}")
@@ -163,17 +158,6 @@ def collect_date_texts(
             ):
                 debug_log(debug, f"stopping at page {page_number} because date prefix changed")
                 break
-
-    return collected_dates
-
-
-def count_by_date(date_texts: list[str], dates: list[str]) -> dict[str, int]:
-    result = {date_text: 0 for date_text in dates}
-
-    for article_date in date_texts:
-        for target_date in dates:
-            if target_date in article_date:
-                result[target_date] += 1
 
     return result
 
@@ -195,9 +179,9 @@ def parse_args() -> argparse.Namespace:
         help='집계할 날짜 목록. 예: --dates 04/01 04/02 04/03',
     )
     parser.add_argument(
-        "--board-url",
-        default=DEFAULT_BOARD_URL,
-        help="검색할 게시판 URL",
+        "--search-url",
+        default=GLOBAL_SEARCH_URL,
+        help="검색 결과 URL 템플릿. 기본값은 전체 검색입니다.",
     )
     parser.add_argument(
         "--driver-path",
@@ -249,12 +233,13 @@ def main() -> int:
     try:
         driver = build_driver(args.driver_path)
         login(driver)
-        search(driver, args.keyword, args.board_url, args.wait_seconds, args.debug)
+        search(driver, args.keyword, args.search_url, args.wait_seconds, args.debug)
         WebDriverWait(driver, max(3, int(args.wait_seconds) + 2)).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, ".article, article"))
         )
-        date_texts = collect_date_texts(
+        result = count_dates_from_search_pages(
             driver,
+            args.dates,
             args.scrolls,
             args.scroll_pause,
             args.max_pages,
@@ -262,10 +247,6 @@ def main() -> int:
             args.debug,
         )
 
-        debug_log(args.debug, f"collected dates sample: {date_texts[:10]}")
-        print(f"수집한 날짜 정보 수: {len(date_texts)}")
-
-        result = count_by_date(date_texts, args.dates)
         print("날짜별 게시글 수:")
         for date_text, count in result.items():
             print(f"{date_text}: {count}")
